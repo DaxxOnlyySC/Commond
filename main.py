@@ -160,7 +160,7 @@ async def get_player_maps(uin, country="ID"):
     url = f"{WORKER_URLS['map']}?uin={uin}&country={country}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                 if r.status == 200:
                     res_json = await r.json()
                     return res_json
@@ -221,15 +221,18 @@ async def map_history_slash(interaction: discord.Interaction, uin: str):
 
     await interaction.followup.send(embed=embed)
 
-@bot.command(name='map')
+@bot.command(name='maplookup', aliases=['map'])
 async def map_prefix(ctx, uin: str = None):
     if not uin:
         await ctx.send(f"Usage: `{PREFIX}map <UIN>`")
         return
+    
+    msg = await ctx.send(f"🔍 Mencari data map untuk UIN **{uin}**...")
+    
     data = await get_player_maps(uin)
 
     if isinstance(data, dict) and "error" in data:
-        await ctx.send(f"Error: {data['error']}")
+        await msg.edit(content=f"❌ Error API: `{data['error']}`")
         return
 
     maps_list = []
@@ -239,7 +242,7 @@ async def map_prefix(ctx, uin: str = None):
         maps_list = data
 
     if not maps_list:
-        await ctx.send(f"No map data found for UIN **{uin}** atau format respons API berbeda.")
+        await msg.edit(content=f"⚠️ Tidak ada data map ditemukan untuk UIN **{uin}**.")
         return
 
     embed = discord.Embed(
@@ -252,13 +255,12 @@ async def map_prefix(ctx, uin: str = None):
         name = m.get("name", m.get("map_name", "Unnamed"))
         pc = m.get("play_count", m.get("plays", 0))
         cc = m.get("collect", m.get("favorites", 0))
-        description += f"**{i}.** {name}\n"
-        description += f"     Plays: {pc:,} | Fav: {cc:,}\n"
+        description += f"**{i}.** {name}\n     Plays: {pc:,} | Fav: {cc:,}\n"
 
     embed.description = description
     embed.set_footer(text="Mini World Map API", icon_url=ctx.author.display_avatar.url)
 
-    await ctx.send(embed=embed)
+    await msg.edit(content=None, embed=embed)
 
 # ============== LUA COMMANDS (via pipe) ==============
 @bot.command(name='trial')
