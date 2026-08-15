@@ -26,6 +26,7 @@ WORKER_URLS = {
     "points": "https://getminipoint.miniworldgameapp.workers.dev/",
     "rename": "https://setaccountname.miniworldgameapp.workers.dev/",
     "season": "https://getseasonexperience.miniworldgameapp.workers.dev/",
+    "map": "https://miniworld-api.daxtercarl1202.workers.dev/",
 }
 
 BADGE_NAMES = {
@@ -154,54 +155,20 @@ def check_trial_or_owner():
         return False
     return commands.check(predicate)
 
-# ============== MAP API FUNCTIONS ==============
-def get_player_maps(uin, country="ID"):
-    cur_time = int(time.time())
-    url = (
-        f"http://shequ.miniworldgame.com:8080/miniw/map/"
-        f"?act=get_room_new_tab_oversea"
-        f"&uin={uin}"
-        f"&country={country}"
-        f"&apiid=410"
-        f"&s2t={cur_time}"
-        f"&ver=1.7.15"
-        f"&time={cur_time}"
-        f"&section=INA"
-        f"&requestid=12345"
-        f"&lang=15"
-        f"&refreshIndex=1"
-    )
+# ============== MAP API FUNCTIONS (Via Cloudflare Worker) ==============
+async def get_player_maps(uin, country="ID"):
+    url = f"{WORKER_URLS['map']}?uin={uin}&country={country}"
     try:
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            return parse_lua_table(r.text)
-        return {"error": f"HTTP {r.status_code}"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    res_json = await r.json()
+                    if "data" in res_json:
+                        return res_json["data"]
+                    return res_json
+                return {"error": f"HTTP {r.status}"}
     except Exception as e:
         return {"error": str(e)}
-
-def parse_lua_table(raw):
-    result = {"recent": [], "featured": []}
-    blocks = re.split(r'\[\d+\]=\{', raw)
-
-    for block in blocks[1:]:
-        try:
-            wid = re.search(r'\["wid"\]="?(\d+)"?', block)
-            name = re.search(r'\["name"\]="([^"]*)"', block)
-            play = re.search(r'\["play_count"\]=(\d+)', block)
-            collect = re.search(r'\["collectc"\]=(\d+)', block)
-
-            map_data = {}
-            if wid: map_data["wid"] = wid.group(1)
-            if name: map_data["name"] = name.group(1)
-            if play: map_data["play_count"] = int(play.group(1))
-            if collect: map_data["collect"] = int(collect.group(1))
-
-            if map_data.get("wid"):
-                result["recent"].append(map_data)
-        except:
-            continue
-
-    return result
 
 # ============== BOT EVENTS ==============
 @bot.event
@@ -222,13 +189,14 @@ async def on_ready():
 async def map_history_slash(interaction: discord.Interaction, uin: str):
     await interaction.response.defer()
 
-    data = get_player_maps(uin)
+    data = await get_player_maps(uin)
 
-    if "error" in data:
+    if isinstance(data, dict) and "error" in data:
         await interaction.followup.send(f"Error: {data['error']}")
         return
 
-    if not data["recent"]:
+    recent_maps = data.get("recent", []) if isinstance(data, dict) else []
+    if not recent_maps:
         await interaction.followup.send(f"No map data found for UIN **{uin}**.")
         return
 
@@ -238,7 +206,7 @@ async def map_history_slash(interaction: discord.Interaction, uin: str):
     )
 
     description = ""
-    for i, m in enumerate(data["recent"][:10], 1):
+    for i, m in enumerate(recent_maps[:10], 1):
         name = m.get("name", "Unnamed")
         pc = m.get("play_count", 0)
         cc = m.get("collect", 0)
@@ -246,7 +214,7 @@ async def map_history_slash(interaction: discord.Interaction, uin: str):
         description += f"     Plays: {pc:,} | Fav: {cc:,}\n"
 
     embed.description = description
-    embed.set_footer(text="Mini World Map API | Powered by shequ.miniworldgame.com")
+    embed.set_footer(text="Mini World Map API | Powered by Cloudflare Worker")
 
     await interaction.followup.send(embed=embed)
 
@@ -255,13 +223,14 @@ async def map_prefix(ctx, uin: str = None):
     if not uin:
         await ctx.send(f"Usage: `{PREFIX}map <UIN>`")
         return
-    data = get_player_maps(uin)
+    data = await get_player_maps(uin)
 
-    if "error" in data:
+    if isinstance(data, dict) and "error" in data:
         await ctx.send(f"Error: {data['error']}")
         return
 
-    if not data["recent"]:
+    recent_maps = data.get("recent", []) if isinstance(data, dict) else []
+    if not recent_maps:
         await ctx.send(f"No map data found for UIN **{uin}**.")
         return
 
@@ -271,7 +240,7 @@ async def map_prefix(ctx, uin: str = None):
     )
 
     description = ""
-    for i, m in enumerate(data["recent"][:10], 1):
+    for i, m in enumerate(recent_maps[:10], 1):
         name = m.get("name", "Unnamed")
         pc = m.get("play_count", 0)
         cc = m.get("collect", 0)
