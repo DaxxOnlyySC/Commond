@@ -2,9 +2,9 @@ import sys, os, time, json, hashlib
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import aiohttp
-import requests
+import asyncio
 import re
 
 import win32file
@@ -133,7 +133,6 @@ async def check_workers():
         workers_online = False
         print(f"[HEALTH] Workers OFFLINE: {e}", flush=True)
 
-from discord.ext import tasks
 @tasks.loop(minutes=5)
 async def health_loop():
     await check_workers()
@@ -155,18 +154,19 @@ def check_trial_or_owner():
         return False
     return commands.check(predicate)
 
-# ============== MAP API FUNCTIONS (Via Cloudflare Worker) ==============
+# ============== MAP API FUNCTIONS ==============
 async def get_player_maps(uin, country="ID"):
     url = f"{WORKER_URLS['map']}?uin={uin}&country={country}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    res_json = await r.json()
-                    return res_json
-                return {"error": f"HTTP {r.status}"}
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status != 200:
+                    return {"error": f"HTTP status {r.status}"}
+                return await r.json()
+    except asyncio.TimeoutError:
+        return {"error": "Request timeout! Worker terlalu lama merespon."}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e)[:150]}
 
 # ============== BOT EVENTS ==============
 @bot.event
@@ -186,39 +186,37 @@ async def on_ready():
 @bot.tree.command(name="map", description="Check Mini World player map history by UIN")
 async def map_history_slash(interaction: discord.Interaction, uin: str):
     await interaction.response.defer()
-
     data = await get_player_maps(uin)
 
     if isinstance(data, dict) and "error" in data:
-        await interaction.followup.send(f"Error: {data['error']}")
+        await interaction.followup.send(f"❌ Error: {data['error']}")
         return
 
     maps_list = []
-    if isinstance(data, dict):
-        maps_list = data.get("data", data.get("recent", data.get("list", [])))
-    elif isinstance(data, list):
+    if isinstance(data, list):
         maps_list = data
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, list):
+                maps_list = value
+                break
+        if not maps_list and data:
+            maps_list = [data]
 
     if not maps_list:
-        await interaction.followup.send(f"No map data found for UIN **{uin}** atau format respons API berbeda.")
+        await interaction.followup.send(f"⚠️ Tidak ada data map atau UIN tidak valid: **{uin}**")
         return
 
-    embed = discord.Embed(
-        title=f"Map History - UIN {uin}",
-        color=0x00ff00
-    )
-
+    embed = discord.Embed(title=f"Map History - UIN {uin}", color=0x00ff00)
     description = ""
     for i, m in enumerate(maps_list[:10], 1):
         name = m.get("name", m.get("map_name", "Unnamed"))
         pc = m.get("play_count", m.get("plays", 0))
         cc = m.get("collect", m.get("favorites", 0))
-        description += f"**{i}.** {name}\n"
-        description += f"     Plays: {pc:,} | Fav: {cc:,}\n"
+        description += f"**{i}.** {name}\n     Plays: {pc:,} | Fav: {cc:,}\n"
 
     embed.description = description
-    embed.set_footer(text="Mini World Map API | Powered by Cloudflare Worker")
-
+    embed.set_footer(text="Mini World Map API")
     await interaction.followup.send(embed=embed)
 
 @bot.command(name='maplookup', aliases=['map'])
@@ -228,7 +226,6 @@ async def map_prefix(ctx, uin: str = None):
         return
     
     msg = await ctx.send(f"🔍 Mencari data map untuk UIN **{uin}**...")
-    
     data = await get_player_maps(uin)
 
     if isinstance(data, dict) and "error" in data:
@@ -236,20 +233,21 @@ async def map_prefix(ctx, uin: str = None):
         return
 
     maps_list = []
-    if isinstance(data, dict):
-        maps_list = data.get("data", data.get("recent", data.get("list", [])))
-    elif isinstance(data, list):
+    if isinstance(data, list):
         maps_list = data
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, list):
+                maps_list = value
+                break
+        if not maps_list and data:
+            maps_list = [data]
 
     if not maps_list:
         await msg.edit(content=f"⚠️ Tidak ada data map ditemukan untuk UIN **{uin}**.")
         return
 
-    embed = discord.Embed(
-        title=f"Map History - UIN {uin}",
-        color=0x00ff00
-    )
-
+    embed = discord.Embed(title=f"Map History - UIN {uin}", color=0x00ff00)
     description = ""
     for i, m in enumerate(maps_list[:10], 1):
         name = m.get("name", m.get("map_name", "Unnamed"))
@@ -259,7 +257,6 @@ async def map_prefix(ctx, uin: str = None):
 
     embed.description = description
     embed.set_footer(text="Mini World Map API", icon_url=ctx.author.display_avatar.url)
-
     await msg.edit(content=None, embed=embed)
 
 # ============== LUA COMMANDS (via pipe) ==============
@@ -328,36 +325,20 @@ async def kick_lua_cmd(ctx, uid: str = None):
         real_uin = "1" + uid
     elif len(uid) == 8:
         real_uin = "10" + uid
-    alt_uid = uid[1:] if (len(uid) == 9 and uid.startswith('1')) or (len(uid) == 10 and uid.startswith('10')) else None
-    if uid in whitelisted_set or real_uin in whitelisted_set or (alt_uid and alt_uid in whitelisted_set):
-        embed = discord.Embed(title="Kick Aborted", description=f"UID `{uid}` (Real: `{real_uin}`) is in the **Whitelist**! Cannot kick.", color=0xff0000)
-        embed.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
+    if uid in whitelisted_set or real_uin in whitelisted_set:
+        embed = discord.Embed(title="Kick Aborted", description=f"UID `{uid}` is in the **Whitelist**!", color=0xff0000)
         await ctx.send(embed=embed)
         return
 
     wl_lua_table = "{" + ", ".join([f'"{u}"' for u in whitelisted_set]) + "}"
     lua_code = f"""threadpool:work(function()
     local targetToCheck = "{real_uin}"
-    local whitelist = {wl_lua_table}
-    local function isWL(u)
-        local s = tostring(u)
-        for _, w in ipairs(whitelist) do
-            if w == s then return true end
-        end
-        return false
-    end
     threadpool:wait(0.1)
     AccountManager.cluster.buddysvr.routemore('gm.kick', targetToCheck, 0)
 end)"""
-
-    embed = discord.Embed(title="Kick Player (Lua)", description=f"Processing kick for UID `{uid}` (Real UIN: `{real_uin}`)...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
-    resp = pipe_send("exec:" + lua_code)
-    embed2 = discord.Embed(title="Kick Result", description=f"✅ Success Processed Kick for UID {uid} > {real_uin}", color=0x00ff00)
-    embed2.add_field(name="Input UID", value=f"`{uid}`", inline=True)
-    embed2.add_field(name="Real UIN", value=f"`{real_uin}`", inline=True)
-    embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await msg.edit(embed=embed2)
+    msg = await ctx.send(embed=discord.Embed(title="Kick Player (Lua)", description=f"Processing kick for UID `{uid}`...", color=0xffff00))
+    pipe_send("exec:" + lua_code)
+    await msg.edit(embed=discord.Embed(title="Kick Result", description=f"✅ Success Processed Kick for UID {uid}", color=0x00ff00))
 
 @bot.command(name='kickpc')
 @check_trial_or_owner()
@@ -368,10 +349,7 @@ async def kickpc_cmd(ctx):
     local whitelist = {wl_lua_table}
     local function isWL(u)
         local s = tostring(u)
-        for _, w in ipairs(whitelist) do
-            if w == s then return true end
-        end
-        return false
+        for _, w in ipairs(whitelist) do if w == s then return end end
     end
     while true do
         if CurWorld and CurMainPlayer and ClientCurGame and ClientCurGame:isInGame() then
@@ -381,15 +359,10 @@ async def kickpc_cmd(ctx):
                 local briefInfo = ClientCurGame:getPlayerBriefInfo(i - 1)
                 if briefInfo and briefInfo.uin and briefInfo.uin > 1000 and briefInfo.uin ~= myUin then
                     local targetUin = briefInfo.uin
-                    if not isWL(targetUin) then
-                        local code, ret = BuddyManager:query_friend_info(targetUin)
-                        if code == ErrorCode.OK and ret and ret.baseinfo and ret.baseinfo.extra then
-                            local deviceSystem = ret.baseinfo.extra.DeviceSystem or ""
-                            if deviceSystem == "windows" or deviceSystem == "Windows" then
-                                ShowGameTipsWithoutFilter("PC player detected: " .. tostring(targetUin) .. ", kicking...")
-                                threadpool:wait(0.1)
-                                AccountManager.cluster.buddysvr.routemore('gm.kick', targetUin, 0)
-                            end
+                    local code, ret = BuddyManager:query_friend_info(targetUin)
+                    if code == ErrorCode.OK and ret and ret.baseinfo and ret.baseinfo.extra then
+                        if ret.baseinfo.extra.DeviceSystem == "windows" then
+                            AccountManager.cluster.buddysvr.routemore('gm.kick', targetUin, 0)
                         end
                     end
                 end
@@ -398,265 +371,53 @@ async def kickpc_cmd(ctx):
         threadpool:wait(1)
     end
 end)"""
-    embed = discord.Embed(title="Kick PC Players", description="Auto-kicking all PC/Windows players (with Whitelist)...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
+    msg = await ctx.send(embed=discord.Embed(title="Kick PC Players", description="Auto-kicking PC players...", color=0xffff00))
     resp = pipe_send("exec:" + lua_code)
-    embed2 = discord.Embed(title="Kick PC Started", description=str(resp), color=0xff0000)
-    embed2.add_field(name="Mode", value="Auto-kick Windows/PC players + Whitelist sync", inline=False)
-    embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await msg.edit(embed=embed2)
-
-@bot.command(name='banplayer')
-@check_trial_or_owner()
-async def banplayer_cmd(ctx):
-    lua_code = r"""threadpool:work(function()
-    local SAVE_PATH = "/storage/emulated/0/自动迷你lua/拉黑设备码本地检测.txt"
-    local function GetLocalBlackDeviceList()
-        local list = {}
-        local ok, file = pcall(io.open, SAVE_PATH, "r")
-        if not ok or not file then return list end
-        for line in file:lines() do
-            local deviceId = line:match("^%s*(.-)%s*$")
-            if deviceId ~= "" then
-                local repeatFlag = false
-                for _, dev in ipairs(list) do
-                    if dev == deviceId then repeatFlag = true; break end
-                end
-                if not repeatFlag then table.insert(list, deviceId) end
-            end
-        end
-        file:close()
-        return list
-    end
-    local function SaveDeviceToLocalBan(targetDevice)
-        local allList = GetLocalBlackDeviceList()
-        local exist = false
-        for _, dev in ipairs(allList) do
-            if dev == targetDevice then exist = true; break end
-        end
-        if exist then return false end
-        table.insert(allList, targetDevice)
-        local ok, file = pcall(io.open, SAVE_PATH, "w")
-        if not ok or not file then return false end
-        for _, dev in ipairs(allList) do file:write(dev .. "\n") end
-        file:close()
-        return true
-    end
-    ShowPlayerList(function(targetUin)
-        local code, ret = BuddyManager:query_friend_info(targetUin)
-        if code ~= ErrorCode.OK or not ret or not ret.baseinfo or not ret.baseinfo.extra then
-            ShowGameTipsWithoutFilter("#RFailed to read player device info", 3)
-            return
-        end
-        local targetDevice = ret.baseinfo.extra.DeviceID or ""
-        if targetDevice == "" then
-            ShowGameTipsWithoutFilter("#RThis player has no device ID", 3)
-            return
-        end
-        local saveResult = SaveDeviceToLocalBan(targetDevice)
-        local allBanList = GetLocalBlackDeviceList()
-        local tipStr
-        if saveResult then
-            tipStr = "Blacklisted device: "..targetDevice.."\nTotal blacklist: "..#allBanList
-        else
-            tipStr = "Device already in blacklist\nTotal: "..#allBanList
-        end
-        ShowGameTipsWithoutFilter(tipStr, 4)
-        GetClientInfo():clickCopy(tipStr)
-    end, "Select player to block")
-end)"""
-    embed = discord.Embed(title="Ban Player", description="Opening player list to ban their device...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
-    resp = pipe_send("exec:" + lua_code)
-    embed2 = discord.Embed(title="Ban Player", description=str(resp), color=0xff0000)
-    embed2.add_field(name="Mode", value="Select player from in-game list -> ban device", inline=False)
-    embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await msg.edit(embed=embed2)
-
-@bot.command(name='autoban')
-@check_trial_or_owner()
-async def autoban_cmd(ctx):
-    whitelisted_set = get_whitelist_set()
-    wl_lua_table = "{" + ", ".join([f'"{u}"' for u in whitelisted_set]) + "}"
-    lua_code = f"""threadpool:work(function()
-    local SAVE_PATH = "/storage/emulated/0/自动迷你lua/拉黑设备码本地检测.txt"
-    local whitelist = {wl_lua_table}
-    local function isWL(u)
-        local s = tostring(u)
-        for _, w in ipairs(whitelist) do
-            if w == s then return true end
-        end
-        return false
-    end
-    local function GetLocalBlackDeviceList()
-        local list = {{}}
-        local ok, file = pcall(io.open, SAVE_PATH, "r")
-        if not ok or not file then return list end
-        for line in file:lines() do
-            local deviceId = line:match("^%s*(.-)%s*$")
-            if deviceId ~= "" then
-                local repeatFlag = false
-                for _, dev in ipairs(list) do
-                    if dev == deviceId then repeatFlag = true; break end
-                end
-                if not repeatFlag then table.insert(list, deviceId) end
-            end
-        end
-        file:close()
-        return list
-    end
-    while true do
-        local banDeviceList = GetLocalBlackDeviceList()
-        if #banDeviceList > 0 then
-            local ok, err = pcall(function()
-                if not (CurWorld and CurMainPlayer and ClientCurGame and ClientCurGame:isInGame()) then return end
-                local myUin = AccountManager:getUin()
-                local playerCount = ClientCurGame:getNumPlayerBriefInfo()
-                for i = 1, playerCount do
-                    local briefInfo = ClientCurGame:getPlayerBriefInfo(i - 1)
-                    if briefInfo and briefInfo.uin and briefInfo.uin > 1000 and briefInfo.uin ~= myUin then
-                        local kickUin = briefInfo.uin
-                        if not isWL(kickUin) then
-                            local code, ret = BuddyManager:query_friend_info(kickUin)
-                            if code == ErrorCode.OK and ret and ret.baseinfo and ret.baseinfo.extra then
-                                local curDevice = ret.baseinfo.extra.DeviceID or ""
-                                if curDevice ~= "" then
-                                    for _, banDev in ipairs(banDeviceList) do
-                                        if curDevice == banDev then
-                                            ShowGameTipsWithoutFilter("#RBlacklisted device player "..kickUin.." kicked")
-                                            AccountManager.cluster.buddysvr.routemore('gm.kick', kickUin, 0)
-                                            break
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-            if not ok then print("Error:", err) end
-        end
-        threadpool:wait(0.3)
-    end
-end)"""
-    embed = discord.Embed(title="Auto Ban Device", description="Running auto-kick for blacklisted devices (with Whitelist)...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
-    resp = pipe_send("exec:" + lua_code)
-    embed2 = discord.Embed(title="Auto Ban Started", description=str(resp), color=0xff0000)
-    embed2.add_field(name="Mode", value="Auto-kick players with blacklisted devices + Whitelist sync", inline=False)
-    embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await msg.edit(embed=embed2)
-
-@bot.command(name='unbanall')
-@check_trial_or_owner()
-async def unbanall_cmd(ctx):
-    lua_code = r"""threadpool:work(function()
-    local SAVE_PATH = "/storage/emulated/0/自动迷你lua/拉黑设备码本地检测.txt"
-    local file = io.open(SAVE_PATH, "w")
-    if file then
-        file:write("")
-        file:close()
-        ShowGameTipsWithoutFilter("#00ff00Blacklist cleared!", 4)
-    else
-        ShowGameTipsWithoutFilter("#ffff00Unable to access file", 3)
-    end
-end)"""
-    embed = discord.Embed(title="Unban All", description="Removing all devices from the blacklist...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
-    resp = pipe_send("exec:" + lua_code)
-    embed2 = discord.Embed(title="Unban All", description=str(resp), color=0x00ff00)
-    embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await msg.edit(embed=embed2)
+    await msg.edit(embed=discord.Embed(title="Kick PC Started", description=str(resp), color=0xff0000))
 
 @bot.command(name='whitelist')
 async def whitelist_cmd(ctx, uid: str = None):
     if ctx.author.id != OWNER_ID:
-        embed = discord.Embed(title="Error", description="Owner only!", color=0xff0000)
-        await ctx.send(embed=embed, delete_after=5)
+        await ctx.send("Owner only!", delete_after=5)
         return
     if not uid:
-        embed = discord.Embed(title="Error", description=f"Usage: `{PREFIX}whitelist <UID>`", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send(f"Usage: `{PREFIX}whitelist <UID>`")
         return
-    real_uin = uid
-    if len(uid) == 9:
-        real_uin = "1" + uid
-    elif len(uid) == 8:
-        real_uin = "10" + uid
+    real_uin = "1" + uid if len(uid) == 9 else uid
     existing = get_whitelist_list()
-    found = False
-    new_list = []
-    for u in existing:
-        if u == real_uin or u == uid:
-            found = True
-        else:
-            new_list.append(u)
-    if found:
-        with open(WL_PC_PATH, 'w', encoding='utf-8') as f:
-            for u in new_list:
-                f.write(u + "\n")
+    if real_uin in existing or uid in existing:
+        new_list = [u for u in existing if u != real_uin and u != uid]
         action = "REMOVED"
     else:
         existing.append(real_uin)
-        with open(WL_PC_PATH, 'w', encoding='utf-8') as f:
-            for u in existing:
-                f.write(u + "\n")
+        new_list = existing
         action = "ADDED"
-    embed = discord.Embed(title="Whitelist Updated", description=f"✅ SUCCESS Executed.", color=0x00ff00)
-    embed.add_field(name="Action", value=f"`{action}`", inline=False)
-    embed.add_field(name="Target UID", value=f"`{uid}` (Real: `{real_uin}`)", inline=False)
-    embed.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=embed)
+    with open(WL_PC_PATH, 'w', encoding='utf-8') as f:
+        for u in new_list:
+            f.write(u + "\n")
+    await ctx.send(embed=discord.Embed(title="Whitelist Updated", description=f"Action: `{action}` | UID: `{uid}`", color=0x00ff00))
 
 @bot.command(name='listwhitelist')
 @check_trial_or_owner()
 async def list_wl_cmd(ctx):
     wl_list = get_whitelist_list()
-    if not wl_list:
-        embed = discord.Embed(title="Whitelist List", description="Whitelist kosong.", color=0x3498db)
-    else:
-        desc = "\n".join([f"`{u}`" for u in wl_list])
-        embed = discord.Embed(title="Daftar UID Whitelist", description=desc, color=0x3498db)
-    embed.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=embed)
+    desc = "\n".join([f"`{u}`" for u in wl_list]) if wl_list else "Whitelist kosong."
+    await ctx.send(embed=discord.Embed(title="Daftar UID Whitelist", description=desc, color=0x3498db))
 
 # ============== CLOUDFLARE API COMMANDS ==============
-@bot.command(name='kickapi')
-@check_trial_or_owner()
-async def kickapi_cmd(ctx, uid: str = None, kick_type: str = "1"):
-    if not uid:
-        embed = discord.Embed(title="Error", description=f"Usage: `{PREFIX}kickapi <UID> [type]`\nType 1 = kick, 2 = force logout", color=0xff0000)
-        await ctx.send(embed=embed)
-        return
-    if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
-        return
-    embed = discord.Embed(title="Kick Player (API)", description=f"Kicking UID `{uid}` via Cloudflare API (type={kick_type})...", color=0xffff00)
-    msg = await ctx.send(embed=embed)
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://kickplayer.miniworldgameapp.workers.dev/?uin={MW_UIN}&pwd={MW_PW}&targetUin={uid}&type={kick_type}"
-            r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
-            data = await r.json()
-            if data.get("code") == 114514:
-                embed2 = discord.Embed(title="✅ Kick API Success", description=f"UID `{uid}` kicked successfully.", color=0x00ff00)
-            else:
-                embed2 = discord.Embed(title="❌ Kick API Failed", description=f"`{data}`", color=0xff0000)
-            embed2.add_field(name="Target", value=f"`{uid}`", inline=True)
-            embed2.add_field(name="Type", value=f"`{kick_type}`", inline=True)
-            embed2.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-            await msg.edit(embed=embed2)
-    except Exception as e:
-        embed2 = discord.Embed(title="❌ Error", description=str(e), color=0xff0000)
-        await msg.edit(embed=embed2)
+@bot.command(name='mwstatus')
+async def mwstatus_cmd(ctx):
+    status = "ONLINE" if workers_online else "OFFLINE"
+    embed = discord.Embed(title="Workers Status", color=discord.Color.green() if workers_online else discord.Color.red())
+    for name in WORKER_URLS:
+        embed.add_field(name=name.capitalize(), value=status, inline=True)
+    await ctx.send(embed=embed)
 
 @bot.command(name='fans')
 @check_trial_or_owner()
 async def fans_cmd(ctx):
     if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send("Workers Offline!")
         return
     await ctx.send(embed=MW_WARNING_embed("FANS", "Verify/add fans"), view=MWAuthView("FANS"))
 
@@ -664,8 +425,7 @@ async def fans_cmd(ctx):
 @check_trial_or_owner()
 async def medal_cmd(ctx):
     if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send("Workers Offline!")
         return
     await ctx.send(embed=MW_WARNING_embed("MEDAL", "Equip medal/badge"), view=MedalBadgeSelect())
 
@@ -673,8 +433,7 @@ async def medal_cmd(ctx):
 @check_trial_or_owner()
 async def points_cmd(ctx):
     if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send("Workers Offline!")
         return
     await ctx.send(embed=MW_WARNING_embed("POINTS", "Add points"), view=MWAuthView("POINTS"))
 
@@ -682,12 +441,10 @@ async def points_cmd(ctx):
 @check_trial_or_owner()
 async def rename_cmd(ctx, *, new_name: str = None):
     if not new_name:
-        embed = discord.Embed(title="Error", description=f"Usage: `{PREFIX}rename <new_name>`", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send(f"Usage: `{PREFIX}rename <new_name>`")
         return
     if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send("Workers Offline!")
         return
     await ctx.send(embed=MW_WARNING_embed("RENAME", f"Change name to `{new_name}`"), view=MWAuthView("RENAME", {"new_name": new_name}))
 
@@ -695,19 +452,9 @@ async def rename_cmd(ctx, *, new_name: str = None):
 @check_trial_or_owner()
 async def season_cmd(ctx):
     if not workers_online:
-        embed = discord.Embed(title="Workers Offline", description="Try again later.", color=0xff0000)
-        await ctx.send(embed=embed)
+        await ctx.send("Workers Offline!")
         return
-    await ctx.send(embed=MW_WARNING_embed("SEASON", "Season Pass XP - 2 phase"), view=MWAuthView("SEASON"))
-
-@bot.command(name='mwstatus')
-async def mwstatus_cmd(ctx):
-    status = "ONLINE" if workers_online else "OFFLINE"
-    embed = discord.Embed(title="Workers Status", color=discord.Color.green() if workers_online else discord.Color.red())
-    for name in WORKER_URLS:
-        embed.add_field(name=name.capitalize(), value=status, inline=True)
-    embed.set_footer(text="Requested by " + str(ctx.author), icon_url=ctx.author.display_avatar.url)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=MW_WARNING_embed("SEASON", "Season Pass XP"), view=MWAuthView("SEASON"))
 
 # ============== VIEWS ==============
 class MWAuthModal(discord.ui.Modal, title="Masukkan Data Akun"):
@@ -723,47 +470,36 @@ class MWAuthModal(discord.ui.Modal, title="Masukkan Data Akun"):
         uid = self.uid_input.value.strip()
         pwd = self.pw_input.value.strip()
         await interaction.response.defer(ephemeral=True)
-        if not workers_online:
-            await interaction.followup.send("Workers offline!", ephemeral=True)
-            return
         try:
             async with aiohttp.ClientSession() as session:
                 if self.action == "FANS":
                     url = f"https://verifygetfans.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}"
                     r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
                     data = await r.json()
-                    if data.get("code") == 114514:
-                        await interaction.followup.send(f"Fans Success: `{uid}`", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Fans Failed: {data}", ephemeral=True)
-                elif self.action == "MEDAL":
-                    medal_ids = self.extra_data.get("medal_ids", "1001")
-                    token = hashlib.sha256((uid + pwd + medal_ids + "fuckmini114514").encode()).hexdigest()
-                    url = f"https://getverifymedal.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}&medalid={medal_ids}&token={token}"
-                    r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
-                    data = await r.json()
-                    if data.get("code") == 114514:
-                        await interaction.followup.send(f"Medal Success: `{uid}` badge `{medal_ids}`", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Medal Failed: {data}", ephemeral=True)
+                    res_txt = f"Fans Success: `{uid}`" if data.get("code") == 114514 else f"Failed: {data}"
+                    await interaction.followup.send(res_txt, ephemeral=True)
                 elif self.action == "POINTS":
                     url = f"https://getminipoint.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}"
                     r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
                     data = await r.json()
-                    if data.get("code") == 114514:
-                        await interaction.followup.send(f"Points Success: `{uid}`", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Points Failed: {data}", ephemeral=True)
+                    res_txt = f"Points Success: `{uid}`" if data.get("code") == 114514 else f"Failed: {data}"
+                    await interaction.followup.send(res_txt, ephemeral=True)
                 elif self.action == "RENAME":
                     new_name = self.extra_data.get("new_name", "")
                     token = hashlib.sha256((uid + pwd + new_name + "fuckmini114514").encode()).hexdigest()
                     url = f"https://setaccountname.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}&newName={new_name}&token={token}"
                     r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
                     data = await r.json()
-                    if data.get("code") == 114514:
-                        await interaction.followup.send(f"Rename Success: `{new_name}`", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Rename Failed: {data}", ephemeral=True)
+                    res_txt = f"Rename Success: `{new_name}`" if data.get("code") == 114514 else f"Failed: {data}"
+                    await interaction.followup.send(res_txt, ephemeral=True)
+                elif self.action == "MEDAL":
+                    medal_ids = self.extra_data.get("medal_ids", "1001")
+                    token = hashlib.sha256((uid + pwd + medal_ids + "fuckmini114514").encode()).hexdigest()
+                    url = f"https://getverifymedal.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}&medalid={medal_ids}&token={token}"
+                    r = await session.get(url, timeout=aiohttp.ClientTimeout(total=15))
+                    data = await r.json()
+                    res_txt = f"Medal Success: `{uid}`" if data.get("code") == 114514 else f"Failed: {data}"
+                    await interaction.followup.send(res_txt, ephemeral=True)
                 elif self.action == "SEASON":
                     r1 = await session.get(f"https://getseasonexperience.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}&type=1", timeout=aiohttp.ClientTimeout(total=15))
                     d1 = await r1.json()
@@ -772,10 +508,8 @@ class MWAuthModal(discord.ui.Modal, title="Masukkan Data Akun"):
                         return
                     r2 = await session.get(f"https://getseasonexperience.miniworldgameapp.workers.dev/?uin={uid}&pwd={pwd}&type=2", timeout=aiohttp.ClientTimeout(total=15))
                     d2 = await r2.json()
-                    if d2.get("code") == 114514:
-                        await interaction.followup.send(f"Season Success: `{uid}`", ephemeral=True)
-                    else:
-                        await interaction.followup.send(f"Season Phase 2 Failed: {d2}", ephemeral=True)
+                    res_txt = f"Season Success: `{uid}`" if d2.get("code") == 114514 else f"Phase 2 Failed: {d2}"
+                    await interaction.followup.send(res_txt, ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"Error: {str(e)[:200]}", ephemeral=True)
 
@@ -804,41 +538,28 @@ class MedalBadgeSelect(discord.ui.View):
 @bot.command(name='menu')
 async def menu_cmd(ctx):
     embed = discord.Embed(title="Mini World Bot - All Commands", color=0x9b59b6)
-    embed.add_field(name="--- MAP API ---", value="`!map <uin>` or `/map <uin>`", inline=False)
-    embed.add_field(name="--- LUA (via pipe) ---", value="`!kick` `!kickpc` `!banplayer` `!autoban` `!unbanall` `!lua`", inline=False)
-    embed.add_field(name="--- CLOUDFLARE API ---", value="`!kickapi` `!fans` `!medal` `!points` `!rename` `!season` `!mwstatus`", inline=False)
-    embed.add_field(name="--- OTHER ---", value="`!inject` `!status` `!ping` `!whitelist` `!listwhitelist` `!trial`", inline=False)
-    embed.set_footer(text=f"Use {PREFIX}cmds for full list")
+    embed.add_field(name="--- MAP API ---", value=f"`{PREFIX}map <uin>` or `/map <uin>`", inline=False)
+    embed.add_field(name="--- LUA (via pipe) ---", value=f"`{PREFIX}kick` `{PREFIX}kickpc` `{PREFIX}lua`", inline=False)
+    embed.add_field(name="--- CLOUDFLARE API ---", value=f"`{PREFIX}fans` `{PREFIX}medal` `{PREFIX}points` `{PREFIX}rename` `{PREFIX}season` `{PREFIX}mwstatus`", inline=False)
+    embed.add_field(name="--- OTHER ---", value=f"`{PREFIX}inject` `{PREFIX}status` `{PREFIX}ping` `{PREFIX}whitelist` `{PREFIX}trial`", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name='cmds')
 async def cmds_cmd(ctx):
     embed = discord.Embed(title="All Commands", color=0x3498db)
-    embed.add_field(name=f"{PREFIX}map <uin>", value="Check player map history (API)", inline=False)
+    embed.add_field(name=f"{PREFIX}map <uin>", value="Check player map history", inline=False)
     embed.add_field(name=f"{PREFIX}kick <uid>", value="Kick player (Lua pipe)", inline=False)
-    embed.add_field(name=f"{PREFIX}kickpc", value="Auto-kick PC players (Lua)", inline=False)
-    embed.add_field(name=f"{PREFIX}banplayer", value="Ban device from list (Lua)", inline=False)
-    embed.add_field(name=f"{PREFIX}autoban", value="Auto-kick blacklisted (Lua)", inline=False)
-    embed.add_field(name=f"{PREFIX}unbanall", value="Clear blacklist (Lua)", inline=False)
-    embed.add_field(name=f"{PREFIX}lua <code>", value="Execute Lua code (pipe)", inline=False)
-    embed.add_field(name=f"{PREFIX}kickapi <uid> [type]", value="Kick via Cloudflare API", inline=False)
     embed.add_field(name=f"{PREFIX}fans", value="Verify fans (API)", inline=False)
     embed.add_field(name=f"{PREFIX}medal", value="Equip badge (API)", inline=False)
     embed.add_field(name=f"{PREFIX}points", value="Add points (API)", inline=False)
     embed.add_field(name=f"{PREFIX}rename <name>", value="Change name (API)", inline=False)
     embed.add_field(name=f"{PREFIX}season", value="Season Pass XP (API)", inline=False)
-    embed.add_field(name=f"{PREFIX}mwstatus", value="Check workers status", inline=False)
-    embed.add_field(name=f"{PREFIX}inject", value="Inject DLL", inline=False)
-    embed.add_field(name=f"{PREFIX}whitelist <uin>", value="Add/remove whitelist [Owner]", inline=False)
-    embed.add_field(name=f"{PREFIX}trial on/off", value="Trial mode [Owner]", inline=False)
-    embed.set_footer(text="LuaExec Discord Bot v2.0 (Merged)")
     await ctx.send(embed=embed)
 
 # ============== MAIN ==============
 def main():
     print("=" * 50)
-    print("  LuaExec Discord Bot v2.0 (Merged + Map API)")
-    print("  Lua pipe + Cloudflare API + Map History")
+    print("  LuaExec Discord Bot v2.0 (Fully Fixed)")
     print("=" * 50)
     connect_pipes()
     bot.run(TOKEN)
