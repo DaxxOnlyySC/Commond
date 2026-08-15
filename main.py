@@ -163,8 +163,6 @@ async def get_player_maps(uin, country="ID"):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     res_json = await r.json()
-                    if "data" in res_json:
-                        return res_json["data"]
                     return res_json
                 return {"error": f"HTTP {r.status}"}
     except Exception as e:
@@ -195,9 +193,14 @@ async def map_history_slash(interaction: discord.Interaction, uin: str):
         await interaction.followup.send(f"Error: {data['error']}")
         return
 
-    recent_maps = data.get("recent", []) if isinstance(data, dict) else []
-    if not recent_maps:
-        await interaction.followup.send(f"No map data found for UIN **{uin}**.")
+    maps_list = []
+    if isinstance(data, dict):
+        maps_list = data.get("data", data.get("recent", data.get("list", [])))
+    elif isinstance(data, list):
+        maps_list = data
+
+    if not maps_list:
+        await interaction.followup.send(f"No map data found for UIN **{uin}** atau format respons API berbeda.")
         return
 
     embed = discord.Embed(
@@ -206,10 +209,10 @@ async def map_history_slash(interaction: discord.Interaction, uin: str):
     )
 
     description = ""
-    for i, m in enumerate(recent_maps[:10], 1):
-        name = m.get("name", "Unnamed")
-        pc = m.get("play_count", 0)
-        cc = m.get("collect", 0)
+    for i, m in enumerate(maps_list[:10], 1):
+        name = m.get("name", m.get("map_name", "Unnamed"))
+        pc = m.get("play_count", m.get("plays", 0))
+        cc = m.get("collect", m.get("favorites", 0))
         description += f"**{i}.** {name}\n"
         description += f"     Plays: {pc:,} | Fav: {cc:,}\n"
 
@@ -229,9 +232,14 @@ async def map_prefix(ctx, uin: str = None):
         await ctx.send(f"Error: {data['error']}")
         return
 
-    recent_maps = data.get("recent", []) if isinstance(data, dict) else []
-    if not recent_maps:
-        await ctx.send(f"No map data found for UIN **{uin}**.")
+    maps_list = []
+    if isinstance(data, dict):
+        maps_list = data.get("data", data.get("recent", data.get("list", [])))
+    elif isinstance(data, list):
+        maps_list = data
+
+    if not maps_list:
+        await ctx.send(f"No map data found for UIN **{uin}** atau format respons API berbeda.")
         return
 
     embed = discord.Embed(
@@ -240,10 +248,10 @@ async def map_prefix(ctx, uin: str = None):
     )
 
     description = ""
-    for i, m in enumerate(recent_maps[:10], 1):
-        name = m.get("name", "Unnamed")
-        pc = m.get("play_count", 0)
-        cc = m.get("collect", 0)
+    for i, m in enumerate(maps_list[:10], 1):
+        name = m.get("name", m.get("map_name", "Unnamed"))
+        pc = m.get("play_count", m.get("plays", 0))
+        cc = m.get("collect", m.get("favorites", 0))
         description += f"**{i}.** {name}\n"
         description += f"     Plays: {pc:,} | Fav: {cc:,}\n"
 
