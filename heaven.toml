@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfile_path = "Dockerfile"
+
+[deploy]
+startCommand = "python main_railway.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
