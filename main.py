@@ -160,7 +160,7 @@ async def get_player_maps(uin, country="ID"):
     url = f"{WORKER_URLS['map']}?uin={uin}&country={country}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     res_json = await r.json()
                     return res_json
